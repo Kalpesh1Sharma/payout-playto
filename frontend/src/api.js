@@ -1,6 +1,7 @@
 import axios from "axios";
 
-const BASE = (import.meta.env.VITE_API_BASE_URL || "") + "/api/v1";
+const BASE = (import.meta.env.VITE_API_BASE_URL || '') + '/api/v1';
+
 
 export const getMerchants = () => axios.get(`${BASE}/merchants/`);
 export const getMerchantLedger = (id) => axios.get(`${BASE}/merchants/${id}/ledger/`);
