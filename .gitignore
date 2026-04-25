@@ -39,3 +39,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+backend/celerybeat-schedule
+backend/celerybeat.pid
