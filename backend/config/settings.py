@@ -68,6 +68,7 @@ CELERY_BEAT_SCHEDULE = {
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
+    "https://payout-playto-1.onrender.com",
 ]
 CORS_ALLOW_ALL_ORIGINS = config("CORS_ALLOW_ALL", default=False, cast=bool)
 
