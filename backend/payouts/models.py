@@ -149,8 +149,8 @@ class PayoutRequest(models.Model):
 
 class WebhookEndpoint(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    merchant = models.ForeignKey(
-        Merchant, on_delete=models.CASCADE, related_name="webhook_endpoints"
+    merchant = models.OneToOneField(
+        Merchant, on_delete=models.CASCADE, related_name="webhook_endpoint"
     )
     url = models.URLField(max_length=500)
     secret = models.CharField(max_length=255)
@@ -159,58 +159,3 @@ class WebhookEndpoint(models.Model):
 
     class Meta:
         db_table = "webhook_endpoints"
-
-
-class WebhookEvent(models.Model):
-    class DeliveryStatus(models.TextChoices):
-        PENDING = "PENDING", "Pending"
-        DELIVERED = "DELIVERED", "Delivered"
-        FAILED_RETRY = "FAILED_RETRY", "FailedRetry"
-        FAILED_PERMANENT = "FAILED_PERMANENT", "FailedPermanent"
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    merchant = models.ForeignKey(
-        Merchant, on_delete=models.CASCADE, related_name="webhook_events"
-    )
-    endpoint = models.ForeignKey(
-        WebhookEndpoint, on_delete=models.CASCADE, related_name="events"
-    )
-    event_type = models.CharField(max_length=100)
-    payload = models.JSONField()
-    delivery_status = models.CharField(
-        max_length=20, choices=DeliveryStatus.choices, default=DeliveryStatus.PENDING
-    )
-    attempt_count = models.IntegerField(default=0)
-    next_attempt_at = models.DateTimeField(null=True, blank=True)
-    last_error = models.TextField(null=True, blank=True)
-    idempotency_key = models.CharField(max_length=255)
-    delivered_at = models.DateTimeField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "webhook_events"
-        indexes = [
-            models.Index(fields=["delivery_status", "next_attempt_at"]),
-            models.Index(fields=["merchant", "created_at"]),
-        ]
-
-
-class AuditLog(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    merchant = models.ForeignKey(
-        Merchant, on_delete=models.CASCADE, related_name="audit_logs"
-    )
-    actor_type = models.CharField(max_length=50)
-    actor_id = models.CharField(max_length=255, null=True, blank=True)
-    action = models.CharField(max_length=100)
-    resource_type = models.CharField(max_length=100)
-    resource_id = models.CharField(max_length=255)
-    metadata = models.JSONField(default=dict)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "audit_logs"
-        indexes = [
-            models.Index(fields=["merchant", "created_at"]),
-            models.Index(fields=["resource_type", "resource_id"]),
-        ]

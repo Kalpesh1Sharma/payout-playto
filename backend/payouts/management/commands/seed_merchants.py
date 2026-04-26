@@ -1,7 +1,10 @@
+import secrets
+import uuid
+
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from payouts.models import BankAccount, LedgerEntry, Merchant
+from payouts.models import BankAccount, LedgerEntry, Merchant, WebhookEndpoint
 
 
 class Command(BaseCommand):
@@ -42,6 +45,15 @@ class Command(BaseCommand):
                         "name": data["name"],
                         "bank_account_number": data["bank_account_number"],
                         "bank_ifsc": data["bank_ifsc"],
+                    },
+                )
+
+                WebhookEndpoint.objects.get_or_create(
+                    merchant=merchant,
+                    defaults={
+                        "url": f"https://webhook.site/#!/{uuid.uuid4()}",
+                        "secret": secrets.token_urlsafe(32),
+                        "is_active": True,
                     },
                 )
 
