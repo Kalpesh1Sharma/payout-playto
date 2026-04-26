@@ -1,108 +1,102 @@
-# Playto Payout Engine
+# Playto Payout Engine (Django)
 
-Production-style payout engine built with Django, DRF, Celery, PostgreSQL, Redis, React, and Tailwind.
+## Problem Statement
+Build a payout engine that remains financially correct under concurrency: multiple payout requests hitting the same merchant must not overspend, must be idempotent, and must leave an auditable, append-only trail of all money movements.
 
-## Stack
+## Architecture
 
-- Backend: Django 4.2 + DRF
-- Queue: Celery + Redis
-- DB: PostgreSQL
-- Frontend: React + Vite + Tailwind
-
-## Project Layout
-
-- `backend/` - API, ledger, payout state machine, celery tasks, tests
-- `frontend/` - merchant dashboard for balances and payout operations
-- `docker-compose.yml` - local orchestration for db/redis/backend/worker/frontend
-
-## Quick Start (Local)
-
-### 1) Backend
-
-```bash
-cd backend
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-# source .venv/bin/activate
-pip install -r requirements.txt
-python manage.py makemigrations payouts
-python manage.py migrate
-python manage.py seed_merchants
-python manage.py runserver
+```
+                 +-------------------+
+                 |  Merchant Client  |
+                 +---------+---------+
+                           |
+                           | HTTP (Idempotency-Key)
+                           v
+                 +-------------------+          +------------------+
+                 | Django + DRF API  |--------->| PostgreSQL       |
+                 | (transactional)   |          | - ledger entries |
+                 +---------+---------+          | - payouts        |
+                           |                    | - idempotency    |
+                           | enqueue            | - audit logs     |
+                           v                    +------------------+
+                 +-------------------+
+                 | Celery Worker     |
+                 | (async processing)|
+                 +---------+---------+
+                           |
+                           v
+                 +-------------------+
+                 | Redis (broker)    |
+                 +-------------------+
 ```
 
-### 2) Worker
+## Core Design Decisions
+- **Ledger-first accounting**: no stored “balance” column; balances are derived from the source of truth (ledger) to avoid drift.
+- **Single-writer per merchant**: concurrency is serialized at the merchant row so “check funds → create payout → create ledger entry” remains correct under parallel requests.
+- **Database-enforced idempotency**: correctness primitives live in PostgreSQL constraints, not in-memory locks.
+- **Atomic critical writes**: payout request + ledger movement + idempotency record update happen inside one `transaction.atomic()` to prevent partial state.
+- **PostgreSQL-only**: SQLite is intentionally unsupported for correctness; it lacks the locking behavior this design relies on.
 
-```bash
-cd backend
-celery -A config worker --loglevel=info
-```
+## Concurrency Handling
+The API uses `SELECT ... FOR UPDATE` on the `Merchant` row inside a transaction to serialize all payout writes for a merchant. This prevents race conditions where two concurrent requests both observe the same derived balance and overspend.
 
-### 3) Frontend
+## Idempotency
+Requests must provide an `Idempotency-Key` header. The system persists:
+- the idempotency key (scoped to merchant),
+- the response status,
+- the response body.
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+The database constraint ensures only one “winner” can reserve the key under concurrency. Retries return the stored response instead of creating duplicate payouts.
 
-Open [http://localhost:5173](http://localhost:5173).
+## Ledger System
+- **Append-only**: `LedgerEntry` is immutable after creation.
+- **Balances are derived**: available balance is computed as `SUM(amount_paise)` over the merchant’s ledger.
+- **All money is paise**: stored as `BigIntegerField` to avoid floating point error.
 
-## Docker Smoke Check
-
-Use this when you want a quick end-to-end validation without relying on local Python setup.
-
-### Start + validate (Windows PowerShell)
-
-```powershell
-.\scripts\smoke-check.ps1
-```
-
-### Start + validate (macOS/Linux)
-
-```bash
-chmod +x ./scripts/smoke-check.sh
-./scripts/smoke-check.sh
-```
-
-### Fast rerun without rebuild
-
-```powershell
-.\scripts\smoke-check.ps1 -NoRebuild
-```
-
-```bash
-./scripts/smoke-check.sh --no-build
-```
-
-### Teardown
-
-```bash
-docker compose down
-```
+## Audit Logging
+Audit records are written with intent:
+- **Success-path logs inside the transaction** so they only exist when the business write commits.
+- **Failure-path logs outside the transaction** so error evidence is not lost to rollbacks.
 
 ## API Endpoints
+Base prefix: `/api/v1`
 
-- `GET /api/v1/merchants/`
-- `GET /api/v1/merchants/{merchant_id}/`
-- `GET /api/v1/merchants/{merchant_id}/ledger/`
-- `POST /api/v1/merchants/{merchant_id}/payouts/create/`
-  - Requires `Idempotency-Key` header
-- `GET /api/v1/merchants/{merchant_id}/payouts/`
-- `GET /api/v1/merchants/{merchant_id}/payouts/{payout_id}/`
+- `GET /merchants/`
+- `GET /merchants/{merchant_id}/`
+- `GET /merchants/{merchant_id}/ledger/`
+- `POST /merchants/{merchant_id}/payouts/create/` (requires `Idempotency-Key`)
+- `GET /merchants/{merchant_id}/payouts/`
+- `GET /merchants/{merchant_id}/payouts/{payout_id}/`
 
-## Running Tests
+## Example API Requests
+
+Create a payout (idempotent):
 
 ```bash
-cd backend
-python manage.py test payouts
+curl -X POST "http://localhost:8000/api/v1/merchants/<merchant_uuid>/payouts/create/" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7b9d2b3a-1c3e-4b9a-9fb2-2a8c2a6f5b1d" \
+  -d '{
+    "amount_paise": 25000,
+    "bank_account_id": "<bank_account_uuid>"
+  }'
 ```
 
-## Notes
+Fetch derived balances + recent ledger entries:
 
-- All money is stored in paise using `BigIntegerField`.
-- Merchant balance is derived from immutable ledger aggregation.
-- Concurrency protection uses `select_for_update()` inside `transaction.atomic()`.
-- Idempotency is enforced by DB unique constraint on `(merchant, key)`.
+```bash
+curl "http://localhost:8000/api/v1/merchants/<merchant_uuid>/ledger/"
+```
+
+## How to Run (Docker)
+This project expects PostgreSQL for correct locking.
+
+```bash
+docker compose up --build
+```
+
+Useful follow-ups:
+- Backend API: `http://localhost:8000/`
+- Admin: `http://localhost:8000/admin/`
+- Teardown: `docker compose down -v`
+

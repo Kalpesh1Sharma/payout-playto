@@ -10,10 +10,12 @@ result = LedgerEntry.objects.filter(merchant=self).aggregate(
 )
 ```
 
-Why this model:
-- `CREDIT` rows are positive, `DEBIT` rows are negative, `REFUND` rows are positive.
-- `amount_paise` is `BigIntegerField` everywhere (no float precision risk).
-- Ledger rows are append-only (`LedgerEntry.save()` blocks updates), so history is auditable.
+Why this design:
+
+1. No balance field is stored on Merchant
+2. This guarantees financial correctness even under partial failures or crashes.
+3. Ledger is append only → prevents inconsistencies
+4. Using integers (paise) avoids floating point errors
 
 ## 2) The Lock
 
@@ -22,40 +24,52 @@ The anti-overdraw lock now uses two DB primitives inside one transaction:
 ```python
 with transaction.atomic():
     locked_merchant = Merchant.objects.select_for_update().get(id=merchant.id)
-    locked_entries = LedgerEntry.objects.select_for_update().filter(
+    balance = LedgerEntry.objects.filter(
         merchant=locked_merchant
-    )
-    balance = locked_entries.aggregate(
-        total=Coalesce(Sum("amount_paise"), Value(0))
-    )["total"]
+    ).aggregate(total=Coalesce(Sum("amount_paise"), Value(0)))["total"]
+
+    if balance < amount_paise:
+        # reject
+    
+    LedgerEntry.objects.create(amount_paise=-amount_paise, ...)
 ```
 
-Why this matters:
-- Merchant row lock serializes payout requests for the same merchant even if ledger is sparse.
-- Ledger row lock keeps the balance read and debit write in the same pessimistic lock scope.
-- Two simultaneous 6000-paise requests on 10000 balance cannot both pass.
+The Merchant row is locked using SELECT FOR UPDATE.
+This serializes all payout requests per merchant and ensures
+"check balance → deduct funds" happens atomically.
+Locking ledger rows is unnecessary because the merchant lock
+already prevents concurrent writes for that merchant.
+This prevents double spending under concurrent requests.
 
 ## 3) The Idempotency
 
-Idempotency is stored in DB and scoped by merchant:
+### How system knows key exists:
+
+1. DB constraint:
 
 ```python
-unique_together = [("merchant", "key")]
+class Meta:
+    db_table = "idempotency_keys"
+    unique_together = [("merchant", "key")]
 ```
+The idempotency response is stored in a JSON-safe format. Initially, storing DRF serializer output caused UUID serialization errors, which would break idempotency guarantees. This was fixed using DRF’s JSONRenderer.
 
 Flow:
-1. Fast-path check for a non-expired key (`created_at >= now-24h`).
-2. Inside `transaction.atomic()`, reserve the key with a placeholder response.
-3. Execute payout create + debit.
-4. Update that same idempotency row to the final JSON-safe response before commit.
 
-The critical fix here is atomicity: previously payout/debit committed before key persistence (crash window). Now key reservation and final response update happen in the same transaction as monetary writes.
+1. First request → creates payout + stores response
+2. Retry request → reads stored response
 
-Expired keys are deleted on-demand in the request path (for the same merchant/key) before reserving a new key. This is intentional for simplicity. The tradeoff is slight latency on the first request after expiry, in exchange for avoiding operational overhead of a separate background cleanup job.
+Concurrent case:
+
+1. Both requests try to insert same key
+2. One succeeds
+3. Other gets IntegrityError → returns existing response
+4. This ensures safe retries without creating duplicate payouts.
+
+
 
 ## 4) The State Machine
 
-All illegal transitions are blocked centrally in `PayoutRequest.transition_to()`:
 
 ```python
 allowed = self.LEGAL_TRANSITIONS.get(self.status, [])
@@ -66,17 +80,19 @@ if new_status not in allowed:
     )
 ```
 
-So transitions like `FAILED -> COMPLETED` are rejected at model level, not scattered in task code.
+Where it's enforced:
+
+1. Inside model method (transition_to)
+2. Called inside transaction.atomic()
+
+Why it works:
+
+1. Prevents invalid transitions (e.g., FAILED → COMPLETED)
+2. Ensures state + ledger updates happen together
 
 ## 5) The AI Audit (Concrete)
 
-### Real bug we hit: UUID JSON serialization in idempotency cache
-
-During testing, the original generated `create_payout()` implementation attempted to **persist the DRF serializer output directly** into `IdempotencyKey.response_body`. DRF returns native Python types (including `uuid.UUID` objects), and Django `JSONField` expects JSON-serializable primitives. The result was a crash like: **`TypeError: Object of type UUID is not JSON serializable`** right at the idempotency write.
-
-#### Before (broken)
-
-This was the problematic pattern: storing `PayoutRequestSerializer(...).data` directly.
+### What AI generated:
 
 ```python
 def _store_idempotency_key(merchant, key, response_status_code, response_body):
@@ -84,22 +100,41 @@ def _store_idempotency_key(merchant, key, response_status_code, response_body):
         merchant=merchant,
         key=key,
         defaults={
-            "response_status": response_status_code,
-            "response_body": response_body,  # <-- contained UUID objects
-        },
+            'response_status': response_status_code,
+            'response_body': response_body,  # raw DRF serializer output
+        }
     )
 ```
 
-#### After (fixed in `backend/payouts/views.py`)
+#### Issue
+1. serializer.data contains UUID objects
+2. JSONField requires JSON-serializable data
+3. Crash
+```
+TypeError: Object of type UUID is not JSON serializable
+```
+4. This bug was critical because it silently broke idempotency guarantees.
 
-The fix was to **force a JSON render/parse roundtrip** before writing to `JSONField`, ensuring UUIDs (and other non-JSON primitives) are converted to strings.
+### What I replaced it with:
 
 ```python
-def _update_idempotency_key(idempotency_record, response_status_code, response_body):
-    safe_response_body = json.loads(JSONRenderer().render(response_body))
-    idempotency_record.response_status = response_status_code
-    idempotency_record.response_body = safe_response_body
-    idempotency_record.save(update_fields=["response_status", "response_body"])
+from rest_framework.renderers import JSONRenderer
+import json
+
+safe_body = json.loads(JSONRenderer().render(response_body))
+IdempotencyKey.objects.get_or_create(
+    merchant=merchant,
+    key=key,
+    defaults={
+        'response_status': response_status_code,
+        'response_body': safe_body,
+    }
+)
+
 ```
 
-This is intentionally “boring” but correct: the idempotency cache now stores exactly what the API would emit as JSON.
+Ensures:
+
+1. UUIDs and datetimes serialized correctly
+2. Safe storage in JSONField
+3. Without this fix, payouts would succeed but idempotency keys would not be stored. Retries would create duplicate payouts and double deduct the merchant's balance.
