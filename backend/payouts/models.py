@@ -159,3 +159,45 @@ class WebhookEndpoint(models.Model):
 
     class Meta:
         db_table = "webhook_endpoints"
+
+
+class WebhookEvent(models.Model):
+    class DeliveryStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        DELIVERED = "DELIVERED", "Delivered"
+        FAILED = "FAILED", "Failed"
+        FAILED_PERMANENT = "FAILED_PERMANENT", "Failed (Permanent)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    merchant = models.ForeignKey(Merchant, on_delete=models.PROTECT, related_name="webhook_events")
+    event_type = models.CharField(max_length=50)
+    payload = models.JSONField()
+    delivery_status = models.CharField(
+        max_length=20, choices=DeliveryStatus.choices, default=DeliveryStatus.PENDING
+    )
+    attempt_count = models.IntegerField(default=0)
+    next_attempt_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(null=True, blank=True)
+    idempotency_key = models.CharField(max_length=255, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "webhook_events"
+
+
+class PayoutAuditLog(models.Model):
+    merchant = models.ForeignKey(Merchant, on_delete=models.PROTECT, related_name="audit_logs")
+    actor_type = models.CharField(max_length=50, default="SYSTEM")
+    actor_id = models.CharField(max_length=255, null=True, blank=True)
+    action = models.CharField(max_length=255)
+    resource_type = models.CharField(max_length=255)
+    resource_id = models.CharField(max_length=255)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "payout_audit_logs"
+        indexes = [
+            models.Index(fields=["merchant", "created_at"]),
+            models.Index(fields=["resource_type", "resource_id"]),
+        ]

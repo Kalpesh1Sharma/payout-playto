@@ -1,14 +1,13 @@
 from django.contrib import admin
 
 from .models import (
-    AuditLog,
     BankAccount,
     IdempotencyKey,
     LedgerEntry,
     Merchant,
+    PayoutAuditLog,
     PayoutRequest,
     WebhookEndpoint,
-    WebhookEvent,
 )
 
 admin.site.register(Merchant)
@@ -17,5 +16,4 @@ admin.site.register(PayoutRequest)
 admin.site.register(BankAccount)
 admin.site.register(IdempotencyKey)
 admin.site.register(WebhookEndpoint)
-admin.site.register(WebhookEvent)
-admin.site.register(AuditLog)
+admin.site.register(PayoutAuditLog)

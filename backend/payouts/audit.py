@@ -1,4 +1,4 @@
-from .models import AuditLog
+from .models import PayoutAuditLog
 
 
 def log_audit(
@@ -11,7 +11,7 @@ def log_audit(
     actor_type="SYSTEM",
     actor_id=None,
 ):
-    AuditLog.objects.create(
+    PayoutAuditLog.objects.create(
         merchant=merchant,
         actor_type=actor_type,
         actor_id=actor_id,
